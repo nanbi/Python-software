@@ -7,7 +7,6 @@ import functools
 
 import numpy as np
 import regreg.api as rr
-<<<<<<< HEAD
 from .lasso import lasso
 from .randomization import randomization
 from .query import multiple_queries, optimization_intervals, affine_gaussian_sampler
@@ -15,9 +14,210 @@ from .query import multiple_queries, optimization_intervals, affine_gaussian_sam
 from .base import restricted_estimator
 from ..constraints.affine import constraints
 from scipy.optimize import bisect
-from scipy.linalg import sqrtm
+from scipy.linalg import sqrtm, qr
 from scipy import matrix, compress, transpose
-from scipy.stats import norm
+from scipy.stats import norm, chi2, f
+from scipy.special import gamma
+from math import pi
+
+
+# this class is for specication problem with weak IV
+# computes the selective pvalue using CLR statistic
+class weak_iv_clr(object):
+
+    def __init__(self, Y, D, Z):
+        self.Z = Z
+        self.D = D
+        self.Y = Y
+        self.n = Z.shape[0]
+        self.p = Z.shape[1]
+        #C_0 is taken to be 10 for now
+        self.C_0 = 10. 
+        self.ZTZ_inv = np.linalg.inv(Z.T.dot(Z))
+        self.ZTD = Z.T.dot(D)
+        self.ZTY = self.Z.T.dot(self.Y)
+
+    def pre_test(self):
+        n, p = self.Z.shape
+        #P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+        #denom = self.D.dot(np.identity(n) - P_Z).dot(self.D) / (n-p)
+        #num = self.D.dot(P_Z).dot(self.D) / p
+        self.DPZD = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTD)
+        self.DPZY = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTY)
+        denom = (self.D.dot(self.D) - self.DPZD) / (n-p)
+        num = self.DPZD / p
+        f = num / denom
+        self.ftest = f
+        self.C = p * denom * self.C_0
+        # C_0 is taken to be 10 for now
+        #C_0 = 10.
+        if f >= self.C_0:
+            return True
+        else:
+            return False
+
+    # take a null parameter value \beta_0 and compute the constants needed
+    def setup(self, parameter=None):
+        if parameter is None:
+            parameter = 0.
+
+        # here we will return the 2 by 2 matrix \hat{\Omega}
+        #P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+        n, p = self.Z.shape
+        #X = np.vstack([self.Y, self.D])
+        #cov_estim = X.dot(np.identity(n)-P_Z).dot(X.T) / (n-p)
+        YPZY = self.ZTY.dot(self.ZTZ_inv).dot(self.ZTY)
+        self.DPZD = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTD)
+        self.DPZY = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTY)
+        YRY = self.Y.dot(self.Y) - YPZY
+        DRY = self.D.dot(self.Y) - self.DPZY
+        DRD = self.D.dot(self.D) - self.DPZD
+        cov_estim = np.zeros((2,2))
+        cov_estim[0,0] = YRY 
+        cov_estim[0,1] = DRY 
+        cov_estim[1,0] = DRY
+        cov_estim[1,1] = DRD
+        self.Omega = cov_estim * 1. / (n-p)
+        self.Omega_inv = np.linalg.inv(self.Omega)
+
+        #self.beta_estim = (self.D.T.dot(P_Z).dot(self.Y)) / (self.D.T.dot(P_Z).dot(self.D))
+
+        b0 = np.array((1., -parameter)).reshape((-1,1))
+        a0 = np.array((parameter, 1.)).reshape((-1,1))
+        sqrt_bomega = np.sqrt(b0.T.dot(self.Omega).dot(b0))
+        sqrt_aomega = np.sqrt(a0.T.dot(self.Omega_inv).dot(a0))
+        sqrt_omega = sqrtm(self.Omega)
+        J0 = np.hstack([sqrt_omega.dot(b0) / sqrt_bomega, sqrtm(self.Omega_inv).dot(a0) / sqrt_aomega])
+
+        cmat = J0.T.dot(sqrt_omega)
+        self.d0 = cmat[0,1] **2
+        self.d1 = 2 * cmat[0,1] * cmat[1,1]
+        self.d2 = cmat[1,1] **2
+
+        temp = sqrtm(self.ZTZ_inv).dot(np.vstack([self.ZTY, self.ZTD]).T)
+        observed = np.hstack([temp.dot(b0) / sqrt_bomega, temp.dot(self.Omega_inv).dot(a0) / sqrt_aomega])
+        Q_obs = observed.T.dot(observed)
+        self.qT_obs = Q_obs[1,1]
+        self.s2_obs = Q_obs[0,1] / np.sqrt(Q_obs[0,0] * Q_obs[1,1])
+
+        self.observed_stat = .5*(Q_obs[0,0]-Q_obs[1,1]+np.sqrt((Q_obs[0,0]+Q_obs[1,1])**2-4.*(Q_obs[0,0]*Q_obs[1,1]-Q_obs[0,1]**2)))
+
+        self.K4 = gamma(self.p/2.)/(np.sqrt(pi)*gamma((self.p-1)/2.))
+
+        # compute tsls estimate
+        self.two_stage_ls = self.DPZY / self.DPZD
+
+
+    def clr_inverse(self, s2):
+        return (self.qT_obs + self.observed_stat) / (1. + self.qT_obs*(s2**2)/self.observed_stat)
+
+    def cond_chisq(self, s2):
+        delta = (self.d1**2) * self.qT_obs * (s2**2) - 4.*self.d0*(self.d2*self.qT_obs-self.C)
+        linterm = -self.d1*np.sqrt(self.qT_obs)*s2
+        if delta <= 0:
+            return 0.
+        else:
+            lroot = (linterm - np.sqrt(delta)) / (2.*self.d0)
+            rroot = (linterm + np.sqrt(delta)) / (2.*self.d0)
+            threshold = np.sqrt(self.clr_inverse(s2))
+            if rroot <= 0:
+                return 0.
+            elif threshold >= rroot:
+                return 0.
+            elif threshold < lroot:
+                return 1.
+            elif threshold >= lroot and lroot >= 0.:
+                return (chi2.cdf(rroot**2, self.p) - chi2.cdf(threshold**2, self.p)) / (chi2.cdf(rroot**2, self.p) - chi2.cdf(lroot**2, self.p))
+            elif lroot < 0.:
+                return (chi2.cdf(rroot**2, self.p) - chi2.cdf(threshold**2, self.p)) / (chi2.cdf(rroot**2, self.p))
+        #if delta <= 0 or linterm+np.sqrt(delta) <= 0:
+        #    return 1.- chi2.cdf(self.clr_inverse(s2), self.p)
+        #elif linterm-np.sqrt(delta) <= 0:
+        #    rroot = (linterm + np.sqrt(delta)) / (2.*self.d0)
+        #    return min(1., (1.-chi2.cdf(self.clr_inverse(s2),self.p)) / (1.-chi2.cdf(rroot**2)))
+        #else:
+        #    lroot = (linterm - np.sqrt(delta)) / (2.*self.d0)
+        #    rroot = (linterm + np.sqrt(delta)) / (2.*self.d0)
+        #    threshold = self.clr_inverse(s2)
+        #    if threshold >= rroot**2:
+        #        return (1.-chi2.cdf(threshold, self.p)) / (1.-chi2.cdf(rroot**2, self.p)+chi2.cdf(lroot**2, self.p))
+        #    else:
+        #        num = 1.-chi2.cdf(threshold, self.p)-(chi2.cdf(rroot**2, self.p)-chi2.cdf(max(lroot**2, threshold), self.p))
+        #        return num / (1.-chi2.cdf(rroot**2, self.p)+chi2.cdf(lroot**2, self.p))
+
+    def density(self, s2):
+        dens = self.K4 * (1.-s2**2)**((self.p-3.)/2.) * self.cond_chisq(s2)
+        return dens
+
+    # evaluate integral of self.density using Simpson's rule
+    def evaluate(self, nsep=100):
+        if nsep % 2 != 0:
+            raise ValueError("nsep need to be an even number!")
+        dx = 2. / nsep
+        fns = np.zeros(nsep+1)
+        for i in range(nsep+1):
+            fns[i] = self.density(-1.+i*dx)
+        nums = np.array([1.] + [4., 2.] * ((nsep-2)/2) + [4., 1.])
+        return np.sum(fns * nums) * dx / 3.
+
+    # this is not quite working yet, hard to find the initial points for bisect
+    def confidence_interval(self, beta_reference=None, how_many=10., level=0.05, myrange=None):
+
+        if beta_reference is None:
+            beta_reference = self.two_stage_ls
+
+        def _root(param):
+            self.setup(parameter=param)
+            return self.evaluate()-level
+
+        if myrange is None:
+            unit = np.std(self.Y)
+            upper = bisect(_root, beta_reference, beta_reference+unit*how_many, xtol=1.e-4)
+            lower = bisect(_root, beta_reference, beta_reference-unit*how_many, xtol=1.e-4) 
+        else:
+            [left, right] = myrange
+            upper = bisect(_root, beta_reference, left, xtol=1.e-4)
+            lower = bisect(_root, beta_reference, right, xtol=1.e-4)            
+
+        return [lower, upper]     
+
+    def naive_chisq(self, s2):
+        return 1.-chi2.cdf(self.clr_inverse(s2), self.p)
+
+    def naive_density(self, s2):
+        dens = self.K4 * (1.-s2**2)**((self.p-3)/2.) * self.naive_chisq(s2)
+        return dens
+
+    def naive_evaluate(self, nsep=100):
+        if nsep % 2 != 0:
+            raise ValueError("nsep need to be an even number!")
+        dx = 2. / nsep
+        fns = np.zeros(nsep+1)
+        for i in range(nsep+1):
+            fns[i] = self.naive_density(-1.+i*dx)
+        nums = np.array([1.] + [4., 2.] * ((nsep-2)/2) + [4., 1.])
+        return np.sum(fns * nums) * dx / 3.
+
+    def naive_confidence_interval(self, beta_reference=None, how_many=10., level=0.05, myrange=None):
+
+        if beta_reference is None:
+            beta_reference = self.two_stage_ls
+
+        def _root(param):
+            self.setup(parameter=param)
+            return self.naive_evaluate()-level
+
+        if myrange is None:
+            unit = np.std(self.Y)
+            upper = bisect(_root, beta_reference, beta_reference+unit*how_many, xtol=1.e-4)
+            lower = bisect(_root, beta_reference, beta_reference-unit*how_many, xtol=1.e-4) 
+        else:
+            [left, right] = myrange
+            upper = bisect(_root, beta_reference, left, xtol=1.e-4)
+            lower = bisect(_root, beta_reference, right, xtol=1.e-4)            
+
+        return [lower, upper] 
+
 
 
 class group_lasso_iv(lasso):
@@ -29,21 +229,28 @@ class group_lasso_iv(lasso):
                  penalty=None,
                  ridge_term=None,
                  randomizer_scale=None,
-                 perturb=None):
+                 perturb=None,
+                 C0 = None):
 
         n, p = Z.shape
-        ZTZ_inv = np.linalg.inv(Z.T.dot(Z))
-        sqrtQ = sqrtm(ZTZ_inv)
-        data_part = sqrtQ.dot(Z.T.dot(D))
+        self.ZTZ_inv = np.linalg.inv(Z.T.dot(Z))
+        sqrtQ = sqrtm(self.ZTZ_inv)
+        self.ZTD = Z.T.dot(D)
+        data_part = sqrtQ.dot(self.ZTD)
         loglike = rr.glm.gaussian(np.identity(p), data_part)
         self.loglike = loglike
         self.nfeature = p = self.loglike.shape[0]
 
-        if penalty is None:
+        if C0 is None:
+            self.C_0 = 10.
             # C_0 is taken to be 10 for now
-            C_0 = 10.
-            P_Z = Z.dot(np.linalg.pinv(Z))
-            penalty = np.sqrt(D.T.dot(np.identity(n)-P_Z).dot(D)*p*C_0/(n-p))
+        else:
+            self.C_0 = C0
+
+        if penalty is None:
+            #P_Z = Z.dot(np.linalg.pinv(Z))
+            #penalty = np.sqrt(D.T.dot(np.identity(n)-P_Z).dot(D)*p*self.C_0/(n-p))
+            penalty = np.sqrt((D.T.dot(D) - self.ZTD.T.dot(self.ZTZ_inv).dot(self.ZTD))*p*self.C_0/(n-p))
         penalty = rr.group_lasso(np.zeros(p), weights=dict({0: penalty}), lagrange=1.)
         self.penalty = penalty
 
@@ -52,8 +259,14 @@ class group_lasso_iv(lasso):
         self.ridge_term = ridge_term
 
         mean_diag = 1. # X is identity matrix here
-        if randomizer_scale is None:
-            randomizer_scale = np.sqrt(mean_diag) * 0.5 * np.std(data_part) * np.sqrt(n / (n - 1.))
+        if p > 1:
+            if randomizer_scale is None:
+                randomizer_scale = np.sqrt(mean_diag) * 0.5 * np.std(data_part) * np.sqrt(n / (n - 1.))
+            else: 
+                randomizer_scale *= np.sqrt(mean_diag) * np.std(data_part * np.sqrt(n / (n - 1.)))
+        elif randomizer_scale is None:
+            randomizer_scale = 0.5
+             
         self.randomizer = randomization.isotropic_gaussian((p,), randomizer_scale)
 
         self._initial_omega = perturb
@@ -127,6 +340,7 @@ class group_lasso_iv(lasso):
                 mean_term = logdens_linear.dot(score.T + offset[:, None]).T
             arg = opt + mean_term
             jacobian_part = self.log_jacobian(opt)
+
             return (-0.5*np.sum(arg*cond_prec.dot(arg.T).T, 1)+jacobian_part)
 
         log_density = functools.partial(log_density, logdens_linear, opt_offset, cond_precision)
@@ -151,6 +365,10 @@ class group_lasso_iv(lasso):
 
     def log_jacobian(self, opt):
         n, p = self.Z.shape
+
+        if p == 1:
+            return 0.
+
         V = np.zeros((p, p-1))
 
         def null(A, eps=1e-12):
@@ -181,16 +399,20 @@ class group_lasso_iv(lasso):
         parameter = np.atleast_1d(parameter)
 
         # compute tsls, i.e. the observed target
-        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
-        denom = self.D.T.dot(P_Z).dot(self.D)
-        two_stage_ls = (self.D.T.dot(P_Z).dot(self.Y)) / denom
-        two_stage_ls = np.atleast_1d(two_stage_ls)
+        #P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+        #denom = self.D.T.dot(P_Z).dot(self.D)
+        #two_stage_ls = (self.D.T.dot(P_Z).dot(self.Y)) / denom
+        self.ZTY = self.Z.T.dot(self.Y)
+        self.DPZD = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTD)
+        self.DPZY = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTY)
+        self.two_stage_ls = self.DPZY / self.DPZD
+        two_stage_ls = np.atleast_1d(self.two_stage_ls)
         observed_target = two_stage_ls
 
         # compute cov_target, cov_target_score
         X, y = self.loglike.data
-        cov_target = np.atleast_2d(Sigma_11/denom)
-        cov_target_score = -1.*(Sigma_12/denom)*y
+        cov_target = np.atleast_2d(Sigma_11/self.DPZD)
+        cov_target_score = -1.*(Sigma_12/self.DPZD)*y
         cov_target_score = np.atleast_2d(cov_target_score)
 
         alternatives = ['twosided']
@@ -226,14 +448,53 @@ class group_lasso_iv(lasso):
 
     # here we will return the 2 by 2 matrix
     def estimate_covariance(self):
-        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
-        beta_estim = (self.D.T.dot(P_Z).dot(self.Y)) / (self.D.T.dot(P_Z).dot(self.D))
+        #P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+        #beta_estim = (self.D.T.dot(P_Z).dot(self.Y)) / (self.D.T.dot(P_Z).dot(self.D))
 
         n = self.Z.shape[0]
-        X = np.vstack([self.Y-self.D*beta_estim, self.D])
-        cov_estim = X.dot(np.identity(n)-P_Z).dot(X.T) / n
-        #cov_estim = (self.Y-self.D*beta_estim).dot(np.identity(n)-P_Z).dot(self.Y-self.D*beta_estim) / n
-        return cov_estim
+        #X = np.vstack([self.Y-self.D*beta_estim, self.D])
+        #cov_estim = X.dot(np.identity(n)-P_Z).dot(X.T) / n
+
+        self.ZTY = self.Z.T.dot(self.Y)
+        YPZY = self.ZTY.dot(self.ZTZ_inv).dot(self.ZTY)
+        self.DPZD = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTD)
+        self.DPZY = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTY)
+        YRY = self.Y.dot(self.Y) - YPZY
+        DRY = self.D.dot(self.Y) - self.DPZY
+        DRD = self.D.dot(self.D) - self.DPZD
+        self.two_stage_ls = self.DPZY / self.DPZD
+        cov_estim = np.zeros((2,2))
+        cov_estim[0,0] = YRY + (self.two_stage_ls**2) * DRD - 2*self.two_stage_ls * DRY
+        cov_estim[0,1] = DRY - self.two_stage_ls * DRD
+        cov_estim[1,0] = DRY - self.two_stage_ls * DRD
+        cov_estim[1,1] = DRD
+
+        return (cov_estim * 1. / n)
+
+    def naive_inference(self, 
+                        parameter=None,
+                        Sigma_11 = 1.,
+                        compute_intervals=False,
+                        level=0.95):
+        if parameter is None:
+            parameter = 0.
+        if self.pre_test():
+            #P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+            #denom = self.D.dot(P_Z).dot(self.D)
+            #tsls = (self.D.dot(P_Z).dot(self.Y)) / denom
+            #std = np.sqrt(Sigma_11 / denom)
+            denom = self.ZTD.T.dot(self.ZTZ_inv).dot(self.ZTD)
+            tsls = (self.ZTD.T.dot(self.ZTZ_inv).dot(self.ZTY)) / denom
+            std = np.sqrt(Sigma_11 / denom)
+            pval = norm.cdf(tsls, loc=parameter, scale=std)
+            pval = 2. * min(pval, 1-pval)
+            interval = None
+            if compute_intervals:
+                interval = [tsls - std * norm.ppf(q=(level+1.)/2.), tsls + std * norm.ppf(q=(level+1.)/2.)]
+            return pval, interval
+        else:
+            #print 'did not pass pre test'
+            return None, None
 
     # there is no invalid IV
     @staticmethod
@@ -269,73 +530,267 @@ class group_lasso_iv(lasso):
     
         return Z, D, Y, beta, gamma
 
+    def pre_test(self):
+        n, p = self.Z.shape
+        #P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+        #denom = self.D.dot(np.identity(n) - P_Z).dot(self.D) / (n-p)
+        #num = self.D.dot(P_Z).dot(self.D) / p
+        self.ZTY = self.Z.T.dot(self.Y)
+        self.DPZD = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTD)
+        self.DPZY = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTY)
+        denom = (self.D.dot(self.D) - self.DPZD) / (n-p)
+        num = self.DPZD / p
+        f = num / denom
+        self.ftest = f
+        # C_0 is taken to be 10 for now
+        #C_0 = 10.
+        if f >= self.C_0:
+            return True
+        else:
+            return False
+
+
+class group_lasso_iv_ar(group_lasso_iv):
+
+    def fit(self,
+            solve_args={'tol': 1.e-12, 'min_its': 50},
+            perturb=None):
+
+        p = self.nfeature
+            
+        if perturb is not None:
+            self._initial_omega = perturb
+        if self._initial_omega is None:
+            self._initial_omega = self.randomizer.sample()
+
+        quad = rr.identity_quadratic(self.ridge_term, 0, -self._initial_omega, 0)
+        problem = rr.simple_problem(self.loglike, self.penalty)
+        self.initial_soln = problem.solve(quad, **solve_args)
+
+        if np.linalg.norm(self.initial_soln) < 1e-10:
+            #print 'no active set, initial_soln: ', self.initial_soln
+            return False
+
+        ## initial state for opt variables
+        initial_subgrad = -(self.loglike.smooth_objective(self.initial_soln, 'grad') + 
+                            quad.objective(self.initial_soln, 'grad'))
+        self.initial_subgrad = initial_subgrad
+
+        initial_scalings = np.linalg.norm(self.initial_soln)
+        self.observed_opt_state = np.atleast_1d(initial_scalings)
+
+        # form linear part
+        self.num_opt_var = self.observed_opt_state.shape[0]
+
+        _opt_linear_term = np.zeros((p, self.num_opt_var))
+        #_score_linear_term = None
+
+        X, y = self.loglike.data
+        # note the minus sign of the score
+        self.observed_score_state = -y
+
+        self._lagrange = self.penalty.weights[0]
+        self.active_directions = initial_subgrad / self._lagrange
+
+        _opt_linear_term = self.active_directions.reshape((-1,1))
+
+        self.opt_transform = (_opt_linear_term, self.initial_subgrad)
+        #self.score_transform = (_score_linear_term, np.zeros(_score_linear_term.shape[0]))
+
+        # compute implied mean and covariance
+
+        cov, prec = self.randomizer.cov_prec
+        opt_linear, opt_offset = self.opt_transform
+
+        cond_precision = opt_linear.T.dot(opt_linear) * prec
+        cond_cov = np.linalg.inv(cond_precision)
+        logdens_linear = cond_cov.dot(opt_linear.T) * prec
+
+        cond_mean = -logdens_linear.dot(self.observed_score_state + opt_offset)
+
+        # log_density should include Jacobian term
+        # it is not used in truncated gaussian sampling but in importance weighting
+        def log_density(logdens_linear, offset, cond_prec, score, opt):
+            if score.ndim == 1:
+                mean_term = logdens_linear.dot(score.T + offset).T
+            else:
+                mean_term = logdens_linear.dot(score.T + offset[:, None]).T
+            arg = opt + mean_term
+            jacobian_part = self.log_jacobian(opt)
+
+            return (-0.5*np.sum(arg*cond_prec.dot(arg.T).T, 1)+jacobian_part)
+
+        log_density = functools.partial(log_density, logdens_linear, opt_offset, cond_precision)
+
+        # now make the constraints
+        A_scaling = -np.identity(self.num_opt_var)
+        b_scaling = np.zeros(self.num_opt_var)
+
+        affine_con = constraints(A_scaling,
+                                 b_scaling,
+                                 mean=cond_mean,
+                                 covariance=cond_cov)
+        logdens_transform = (logdens_linear, opt_offset)
+        self.sampler = affine_gaussian_sampler_iv(affine_con,
+                                               self.observed_opt_state,
+                                               self.observed_score_state,
+                                               log_density,
+                                               logdens_transform)
+
+        return True
+
+    def summary(self,
+                parameter=None,
+                Sigma_11 = 1.,
+                Sigma_12 = .8,
+                level=0.95,
+                ndraw=1000,
+                burnin=1000,
+                compute_intervals=False,
+                compute_power=False,
+                beta_alternative=None):
+
+        if parameter is None: # this is for pivot -- could use true beta^*
+            parameter = np.zeros(1)
+
+        parameter = np.atleast_1d(parameter)
+
+        # compute the observed_target for AR statistic
+        # target = Z^T (Y-D \beta_0)
+
+        self.ZTZ = self.Z.T.dot(self.Z)
+        self.ZTY = self.Z.T.dot(self.Y)
+        self.DPZD = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTD)
+        self.DPZY = self.ZTD.dot(self.ZTZ_inv).dot(self.ZTY)
+
+        self.K1 = self.ZTY
+        self.K2 = self.ZTD
+        observed_target = self.K1 - self.K2 * parameter
+
+        # compute cov_target, cov_target_score
+
+        cov_target = self.ZTZ * Sigma_11
+        cov_target_score = sqrtm(self.ZTZ)
+        cov_target_score *= - Sigma_12
+
+        # tsls estimator as beta reference for confidence interval
+        two_stage_ls = self.DPZY / self.DPZD
+        observed_target_tsls = self.K1 - self.K2 * two_stage_ls
+
+        # this is for Anderson-Rubin
+        alternatives = ['greater']
+
+        opt_sample = self.sampler.sample(ndraw, burnin)
+
+        pivots = self.sampler.coefficient_pvalues(observed_target,
+                                                  cov_target,
+                                                  cov_target_score,
+                                                  self.K2,
+                                                  self.test_stat,
+                                                  parameter=parameter, 
+                                                  sample=opt_sample,
+                                                  alternatives=alternatives)
+
+        if not np.all(parameter == 0):
+            pvalues = self.sampler.coefficient_pvalues(observed_target, 
+                                                       cov_target, 
+                                                       cov_target_score, 
+                                                       self.K2,
+                                                       self.test_stat,
+                                                       parameter=np.zeros_like(parameter), 
+                                                       sample=opt_sample,
+                                                       alternatives=alternatives)
+        else:
+            pvalues = pivots
+
+        intervals = None
+
+        coverage = self.sampler.confidence_interval_coverage(observed_target_tsls,
+                                                  cov_target,
+                                                  cov_target_score,
+                                                  self.K2,
+                                                  self.test_stat,
+                                                  beta_reference=two_stage_ls,
+                                                  beta_candidate=parameter,
+                                                  sample=opt_sample,
+                                                  level=level)
+
+        if compute_intervals:
+            intervals = self.sampler.confidence_intervals(observed_target_tsls, 
+                                                          cov_target, 
+                                                          cov_target_score, 
+                                                          self.K2,
+                                                          self.test_stat,
+                                                          beta_reference=two_stage_ls,
+                                                          sample=opt_sample,
+                                                          level=level,
+                                                          how_many_sd=4000)
+            return pivots, pvalues, intervals
+
+        if compute_power:
+            if beta_alternative is None:
+                beta_alternative = np.array([i*0.02+parameter[0] for i in range(-5,6) if i != 0])
+            powers = []
+            for beta in beta_alternative:
+                detection = ~self.sampler.confidence_interval_coverage(observed_target_tsls,
+                                                  cov_target,
+                                                  cov_target_score,
+                                                  self.K2,
+                                                  self.test_stat,
+                                                  beta_reference=two_stage_ls,
+                                                  beta_candidate=beta,
+                                                  sample=opt_sample,
+                                                  level=level)
+                powers.append(detection)
+
+            return pivots, pvalues, coverage, powers
+
+        return pivots, pvalues, coverage
+
+
+
+    def test_stat(self, parameter, target):
+        # target is of n by p
+        target = np.atleast_2d(target)
+
+        n, p = self.Z.shape
+        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+        R_Z = np.identity(n) - P_Z
+        denom = (self.Y-self.D*parameter).dot(R_Z).dot(self.Y-self.D*parameter) / (n-p)
+        ZTZ_inv = np.linalg.inv(self.Z.T.dot(self.Z))
+        result = np.sum(target * (ZTZ_inv.dot(target.T).T), axis=1)
+        result = result / p / denom
+
+        return result
+
+    # have not implemented C.I. yet
     def naive_inference(self, 
                         parameter=None,
                         Sigma_11 = 1.,
+                        Sigma_12 = .8, 
                         compute_intervals=False,
                         level=0.95):
         if parameter is None:
             parameter = 0.
         if self.pre_test():
+            self.ZTY = self.Z.T.dot(self.Y)
+            target = self.ZTY - self.ZTD * parameter
+            n, p = self.Z.shape
             P_Z = self.Z.dot(np.linalg.pinv(self.Z))
-            denom = self.D.dot(P_Z).dot(self.D)
-            tsls = (self.D.dot(P_Z).dot(self.Y)) / denom
-            std = np.sqrt(Sigma_11 / denom)
-            pval = norm.cdf(tsls, loc=parameter, scale=std)
-            pval = 2. * min(pval, 1-pval)
-            interval = None
-            if compute_intervals:
-                interval = [tsls - std * norm.ppf(q=level), tsls + std * norm.ppf(q=level)]
-            return pval, interval
+            R_Z = np.identity(n) - P_Z
+            denom = (self.Y-self.D*parameter).dot(R_Z).dot(self.Y-self.D*parameter) / (n-p)
+            ZTZ_inv = np.linalg.inv(self.Z.T.dot(self.Z))
+            tar = target.dot(ZTZ_inv).dot(target) / p / denom
+            pval = 1. - f.cdf(tar, dfn=p, dfd=n-p) 
+            return pval
         else:
             #print 'did not pass pre test'
-            return None, None
-
-    def pre_test(self):
-        n, p = self.Z.shape
-        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
-        denom = self.D.dot(np.identity(n) - P_Z).dot(self.D) / (n-p)
-        num = self.D.dot(P_Z).dot(self.D) / p
-        f = num / denom
-        # C_0 is taken to be 10 for now
-        C_0 = 10.
-        if f >= C_0:
-            return True
-        else:
-            return False
-
-    # no pre-test, just to see how the normality theory breaks down
-    def plain_inference(self, 
-                        parameter=None,
-                        Sigma_11 = 1.,
-                        compute_intervals=False,
-                        level=0.95):
-        if parameter is None:
-            parameter = 0.
-            
-        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
-        denom = self.D.dot(P_Z).dot(self.D)
-        tsls = (self.D.dot(P_Z).dot(self.Y)) / denom
-        std = np.sqrt(Sigma_11 / denom)
-        pval = norm.cdf(tsls, loc=parameter, scale=std)
-        pval = 2. * min(pval, 1-pval)
-        interval = None
-        if compute_intervals:
-            interval = [tsls - std * norm.ppf(q=level), tsls + std * norm.ppf(q=level)]
-        return pval, interval
+            return None
 
 
 
 
 class lasso_iv(lasso):
-=======
-from .lasso import highdim
-#from .randomization import randomization
-#from .query import multiple_queries, optimization_sampler
-#from .M_estimator import restricted_Mest
-
-class lasso_iv(highdim):
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
 
     r"""
     A class for the LASSO with invalid instrumental variables for post-selection inference.
@@ -374,7 +829,6 @@ class lasso_iv(highdim):
         if penalty is None:
             penalty = 2.01 * np.sqrt(n * np.log(n))
         penalty = np.ones(loglike.shape[0]) * penalty
-<<<<<<< HEAD
         penalty[-1] = 0.
 
         mean_diag = np.mean((P_ZX**2).sum(0))
@@ -385,18 +839,13 @@ class lasso_iv(highdim):
         if randomizer_scale is None:
             #randomizer_scale = 0.5*np.sqrt(n)
             randomizer_scale = np.sqrt(mean_diag) * 0.5 * np.std(P_ZY) * np.sqrt(n / (n - 1.))
+        else: 
+            randomizer_scale *= np.sqrt(mean_diag) * np.std(P_ZY) * np.sqrt(n / (n - 1.))
 
         lasso.__init__(self, loglike, penalty, ridge_term, randomizer_scale)
         self.Z = Z
         self.D = D
         self.Y = Y
-
-        #self.sampler = affine_gaussian_test_stat_sampler(affine_con,
-        #                                                self.observed_opt_state,
-        #                                                self.observed_score_state,
-        #                                                log_density,
-        #                                                logdens_transform,
-        #                                                selection_info=self.selection_variable)
 
 
     # this is a direct modification of fit() 
@@ -584,19 +1033,6 @@ class lasso_iv(highdim):
                                                selection_info=self.selection_variable) # should be signs and the subgradients we've conditioned on
         
         return active_signs
-=======
-        #penalty[-1] = 0.
-        penalty[-1] /= 1000.
-
-        if ridge_term is None:
-            ridge_term = 1. * np.sqrt(n)
-
-        if randomizer_scale is None:
-            randomizer_scale = 0.5*np.sqrt(n)
-
-        highdim.__init__(self, loglike, penalty, ridge_term, randomizer_scale)
-        self.Z = Z
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
 
 
     def summary(self,
@@ -605,13 +1041,9 @@ class lasso_iv(highdim):
                 level=0.95,
                 ndraw=10000, 
                 burnin=2000,
-<<<<<<< HEAD
                 compute_intervals=True,
                 compute_power=False,
                 beta_alternative=None):
-=======
-                compute_intervals=False):
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
         """
         Produce p-values and confidence intervals for targets
         of model including selected features
@@ -648,7 +1080,6 @@ class lasso_iv(highdim):
 
         P_Z = self.Z.dot(np.linalg.pinv(self.Z))
         P_ZE = self.Z[:,self._overall[:-1]].dot(np.linalg.pinv(self.Z[:,self._overall[:-1]]))
-<<<<<<< HEAD
         #P_ZX, P_ZY = self.loglike.data
         #P_ZD = P_ZX[:,-1]
         #two_stage_ls = (P_ZD.dot(P_Z-P_ZE).dot(self.P_ZY-P_ZD*parameter))/np.sqrt(Sigma_11*P_ZD.dot(P_Z-P_ZE).dot(P_ZD))
@@ -658,13 +1089,6 @@ class lasso_iv(highdim):
         denom = self.D.dot(P_Z - P_ZE).dot(self.D)
         two_stage_ls = self.D.dot(P_Z - P_ZE).dot(self.Y) / denom
 
-=======
-        P_ZX, P_ZY = self.loglike.data
-        P_ZD = P_ZX[:,-1]
-        #two_stage_ls = (P_ZD.dot(P_Z-P_ZE).dot(self.P_ZY-P_ZD*parameter))/np.sqrt(Sigma_11*P_ZD.dot(P_Z-P_ZE).dot(P_ZD))
-        denom = P_ZD.dot(P_Z - P_ZE).dot(P_ZD)
-        two_stage_ls = (P_ZD.dot(P_Z - P_ZE).dot(P_ZY)) / denom
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
         two_stage_ls = np.atleast_1d(two_stage_ls)
         observed_target = two_stage_ls
 
@@ -673,12 +1097,8 @@ class lasso_iv(highdim):
 
         cov_target = np.atleast_2d(Sigma_11/denom)
         #score_cov = -1.*np.sqrt(Sigma_11/P_ZD.dot(P_Z-P_ZE).dot(P_ZD))*np.hstack([self.Z.T.dot(P_Z-P_ZE).dot(P_ZD),P_ZD.dot(P_Z-P_ZE).dot(P_ZD)])
-<<<<<<< HEAD
         #cov_target_score = -1.*(Sigma_11/denom)*np.hstack([self.Z.T.dot(P_Z-P_ZE).dot(P_ZD),P_ZD.dot(P_Z-P_ZE).dot(P_ZD)])
         cov_target_score = -1.*(Sigma_11/denom)*np.hstack([self.Z.T.dot(P_Z - P_ZE).dot(self.D), self.D.dot(P_Z - P_ZE).dot(self.D)])
-=======
-        cov_target_score = -1.*(Sigma_11/denom)*np.hstack([self.Z.T.dot(P_Z-P_ZE).dot(P_ZD),P_ZD.dot(P_Z-P_ZE).dot(P_ZD)])
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
         cov_target_score = np.atleast_2d(cov_target_score)
 
         alternatives = ['twosided']
@@ -707,7 +1127,6 @@ class lasso_iv(highdim):
             intervals = self.sampler.confidence_intervals(observed_target, 
                                                           cov_target, 
                                                           cov_target_score, 
-<<<<<<< HEAD
                                                           sample=opt_sample,
                                                           level=level)
 
@@ -733,21 +1152,34 @@ class lasso_iv(highdim):
         return cov_estim
 
 
+    def naive_inference(self, 
+                        parameter=None,
+                        Sigma_11 = 1.,
+                        compute_intervals=False,
+                        level=0.95):
+
+        if parameter is None:
+            parameter = 0.
+            
+        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
+        P_ZE = self.Z[:,self._overall[:-1]].dot(np.linalg.pinv(self.Z[:,self._overall[:-1]]))
+
+        denom = self.D.dot(P_Z - P_ZE).dot(self.D)
+        tsls = self.D.dot(P_Z - P_ZE).dot(self.Y) / denom
+        std = np.sqrt(Sigma_11 / denom)
+        pval = norm.cdf(tsls, loc=parameter, scale=std)
+        pval = 2. * min(pval, 1-pval)
+        interval = None
+        if compute_intervals:
+            interval = [tsls - std * norm.ppf(q=(level+1.)/2.), tsls + std * norm.ppf(q=(level+1.)/2.)]
+        return pval, interval
+
+
     @staticmethod
     def bigaussian_instance(n=1000,p=10,
                             s=3,snr=7.,random_signs=False, #true alpha parameter
                             gsnr_invalid = 1., #true gamma parameter
                             gsnr_valid = 1.,
-=======
-                                                          sample=opt_sample)
-
-        return pivots, pvalues, intervals
-
-    @staticmethod
-    def bigaussian_instance(n=1000,p=10,
-                            s=3,snr=7.,random_signs=False, #true alpha parameter
-                            gsnr = 1., #true gamma parameter
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
                             beta = 1., #true beta parameter
                             Sigma = np.array([[1., 0.8], [0.8, 1.]]), #noise variance matrix
                             rho=0,scale=False,center=True): #Z matrix structure, note that scale=TRUE will simulate weak IV case!
@@ -761,14 +1193,10 @@ class lasso_iv(highdim):
         active = np.zeros(p, np.bool)
         active[:s] = True
         # --> gamma coefficient
-<<<<<<< HEAD
         #gamma = np.repeat([gsnr],p)
         gamma = np.ones(p)
         gamma[:s] *= gsnr_invalid
         gamma[s:] *= gsnr_valid
-=======
-        gamma = np.repeat([gsnr],p)
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
 
         # Generate samples
         # Generate Z matrix 
@@ -789,7 +1217,6 @@ class lasso_iv(highdim):
         return Z, D, Y, alpha, beta, gamma
 
 
-<<<<<<< HEAD
 
 class lasso_iv_ar(lasso):
 
@@ -840,6 +1267,8 @@ class lasso_iv_ar(lasso):
         if randomizer_scale is None:
             #randomizer_scale = 0.5*np.sqrt(n)
             randomizer_scale = np.sqrt(mean_diag) * 0.5 * np.std(P_ZY) * np.sqrt(n / (n - 1.))
+        else:
+            randomizer_scale *= np.sqrt(mean_diag) * np.std(P_ZY) * np.sqrt(n / (n - 1.))
 
         lasso.__init__(self, loglike, penalty, ridge_term, randomizer_scale)
         self.Z = Z
@@ -848,28 +1277,16 @@ class lasso_iv_ar(lasso):
 
 
     # the ONLY change is .sampler line
-    def fit(self, 
-            solve_args={'tol':1.e-12, 'min_its':50}, 
-            perturb=None):
-        """
-        Fit the randomized lasso using `regreg`.
-        Parameters
-        ----------
-        solve_args : keyword args
-             Passed to `regreg.problems.simple_problem.solve`.
-        Returns
-        -------
-        signs : np.float
-             Support and non-zero signs of randomized lasso solution.
-             
-        """
+    def fit_for_marginalize(self, 
+                            solve_args={'tol':1.e-12, 'min_its':50}, 
+                            perturb=None):
 
         p = self.nfeature
 
         if perturb is None:
             perturb = self.randomizer.sample()
         self._initial_omega = perturb
-        quad = rr.identity_quadratic(self.ridge_term, 0, -perturb)
+        quad = rr.identity_quadratic(self.ridge_term, 0, -perturb, 0)
         problem = rr.simple_problem(self.loglike, self.penalty)
         self.initial_soln = problem.solve(quad, **solve_args)
 
@@ -900,7 +1317,8 @@ class lasso_iv_ar(lasso):
         initial_unpenalized = self.initial_soln[self._unpenalized]
 
         self.observed_opt_state = np.concatenate([initial_scalings,
-                                                  initial_unpenalized])
+                                                  initial_unpenalized,
+                                                  self.initial_subgrad[self._inactive]], axis=0)
 
         _beta_unpenalized = restricted_estimator(self.loglike, self._overall, solve_args=solve_args)
 
@@ -927,17 +1345,22 @@ class lasso_iv_ar(lasso):
 
         # \bar{\beta}_{E \cup U} piece -- the unpenalized M estimator
 
+        est_slice = slice(0, overall.sum())
         X, y = self.loglike.data
         W = self._W = self.loglike.saturated_loss.hessian(X.dot(beta_bar))
         _hessian_active = np.dot(X.T, X[:, active] * W[:, None])
         _hessian_unpen = np.dot(X.T, X[:, unpenalized] * W[:, None])
 
-        _score_linear_term = -np.hstack([_hessian_active, _hessian_unpen])
+        _score_linear_term[:, est_slice] = -np.hstack([_hessian_active, _hessian_unpen])
+
+        null_idx = np.arange(overall.sum(), p)
+        inactive_idx = np.nonzero(inactive)[0]
+        for _i, _n in zip(inactive_idx, null_idx):
+            _score_linear_term[_i,_n] = -1
 
         # set the observed score (data dependent) state
 
-        self.observed_score_state = _score_linear_term.dot(_beta_unpenalized)
-        self.observed_score_state[inactive] += self.loglike.smooth_objective(beta_bar, 'grad')[inactive]
+        self.observed_score_state = _score_linear_term.dot(self.observed_internal_state)
 
         def signed_basis_vector(p, j, s):
             v = np.zeros(p)
@@ -955,16 +1378,24 @@ class lasso_iv_ar(lasso):
 
         # beta_U piece
 
-        unpenalized_slice = slice(active.sum(), self.num_opt_var)
+        unpenalized_slice = slice(active.sum(), active.sum() + unpenalized.sum())
         unpenalized_directions = np.array([signed_basis_vector(p, j, 1) for j in np.nonzero(unpenalized)[0]]).T
         if unpenalized.sum():
             _opt_linear_term[:, unpenalized_slice] = (_hessian_unpen
                                                       + self.ridge_term * unpenalized_directions) 
 
+        subgrad_idx = range(active.sum() + unpenalized.sum(), active.sum() + inactive.sum() + unpenalized.sum())
+        subgrad_slice = slice(active.sum() + unpenalized.sum(), active.sum() + inactive.sum() + unpenalized.sum())
+        for _i, _s in zip(inactive_idx, subgrad_idx):
+            _opt_linear_term[_i,_s] = 1
+
         # two transforms that encode score and optimization
         # variable roles 
 
-        self.opt_transform = (_opt_linear_term, self.initial_subgrad)
+        _opt_affine_term = np.zeros(p)
+        _opt_affine_term[active] = active_signs[active] * self._lagrange[active]
+
+        self.opt_transform = (_opt_linear_term, _opt_affine_term)
         self.score_transform = (_score_linear_term, np.zeros(_score_linear_term.shape[0]))
 
         # now store everything needed for the projections
@@ -998,11 +1429,19 @@ class lasso_iv_ar(lasso):
 
         # now make the constraints
 
-        A_scaling = -np.identity(self.num_opt_var)
-        b_scaling = np.zeros(self.num_opt_var)
+        inactive_lagrange = self.penalty.weights[inactive]
 
-        affine_con = constraints(A_scaling,
-                                 b_scaling,
+        I = np.identity(cond_cov.shape[0])
+        A_scaling = -I[self.scaling_slice]
+        b_scaling = np.zeros(A_scaling.shape[0])
+        A_subgrad = np.vstack([I[subgrad_slice],-I[subgrad_slice]])
+        b_subgrad = np.hstack([inactive_lagrange,inactive_lagrange])
+
+        linear_term = np.vstack([A_scaling, A_subgrad])
+        offset = np.hstack([b_scaling, b_subgrad])
+
+        affine_con = constraints(linear_term,
+                                 offset,
                                  mean=cond_mean,
                                  covariance=cond_cov)
 
@@ -1017,11 +1456,6 @@ class lasso_iv_ar(lasso):
         
         return active_signs
 
-=======
-# rescaled version of lasso_iv which uses the scaled \sqrt{n} beta_hat as target
-# only need to change observed_target, cov_target, cov_target_score and also parameter input
-class rescaled_lasso_iv(lasso_iv):
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
 
     def summary(self,
                 parameter=None,
@@ -1029,13 +1463,9 @@ class rescaled_lasso_iv(lasso_iv):
                 level=0.95,
                 ndraw=10000, 
                 burnin=2000,
-<<<<<<< HEAD
                 compute_intervals=False,
                 compute_power=False,
                 beta_alternative=None):
-=======
-                compute_intervals=False):
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
         """
         Produce p-values and confidence intervals for targets
         of model including selected features
@@ -1066,7 +1496,6 @@ class rescaled_lasso_iv(lasso_iv):
         if parameter is None: # this is for pivot -- could use true beta^*
             parameter = np.zeros(1)
 
-<<<<<<< HEAD
         parameter = np.atleast_1d(parameter)
 
         # compute the observed_target for AR statistic
@@ -1082,29 +1511,10 @@ class rescaled_lasso_iv(lasso_iv):
         self.K2 = self.Z.T.dot(R_ZE).dot(self.D)
         #observed_target = self.Z.T.dot(R_ZE).dot(self.Y - self.D * parameter)
         observed_target = self.K1 - self.K2 * parameter
-=======
-        n, _ = self.Z.shape
-        parameter *= np.sqrt(n)
-        parameter = np.atleast_1d(parameter)
-
-        # compute tsls, i.e. the observed_target
-
-        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
-        P_ZE = self.Z[:,self._overall[:-1]].dot(np.linalg.pinv(self.Z[:,self._overall[:-1]]))
-        P_ZX, P_ZY = self.loglike.data
-        P_ZD = P_ZX[:,-1]
-        #two_stage_ls = (P_ZD.dot(P_Z-P_ZE).dot(self.P_ZY-P_ZD*parameter))/np.sqrt(Sigma_11*P_ZD.dot(P_Z-P_ZE).dot(P_ZD))
-        denom = P_ZD.dot(P_Z - P_ZE).dot(P_ZD)
-        two_stage_ls = (P_ZD.dot(P_Z - P_ZE).dot(P_ZY)) / denom
-        two_stage_ls = np.atleast_1d(two_stage_ls)
-        observed_target = two_stage_ls
-        observed_target *= np.sqrt(n)
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
 
         # only has the parametric version right now
         # compute cov_target, cov_target_score
 
-<<<<<<< HEAD
         cov_target = self.Z.T.dot(R_ZE).dot(self.Z) * Sigma_11
         cov_target_score = np.hstack([self.Z, self.D.reshape((-1,1))]).T.dot(R_ZE).dot(self.Z)
         cov_target_score *= - Sigma_11
@@ -1124,22 +1534,6 @@ class rescaled_lasso_iv(lasso_iv):
                                                   cov_target_score,
                                                   self.K2,
                                                   self.test_stat,
-=======
-        cov_target = np.atleast_2d(Sigma_11/denom)
-        cov_target *= n
-        #score_cov = -1.*np.sqrt(Sigma_11/P_ZD.dot(P_Z-P_ZE).dot(P_ZD))*np.hstack([self.Z.T.dot(P_Z-P_ZE).dot(P_ZD),P_ZD.dot(P_Z-P_ZE).dot(P_ZD)])
-        cov_target_score = -1.*(Sigma_11/denom)*np.hstack([self.Z.T.dot(P_Z-P_ZE).dot(P_ZD),P_ZD.dot(P_Z-P_ZE).dot(P_ZD)])
-        cov_target_score = np.atleast_2d(cov_target_score)
-        cov_target_score *= np.sqrt(n)
-
-        alternatives = ['twosided']
-
-        opt_sample = self.sampler.sample(ndraw, burnin)
-
-        pivots = self.sampler.coefficient_pvalues(observed_target, 
-                                                  cov_target, 
-                                                  cov_target_score, 
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
                                                   parameter=parameter, 
                                                   sample=opt_sample,
                                                   alternatives=alternatives)
@@ -1148,11 +1542,8 @@ class rescaled_lasso_iv(lasso_iv):
             pvalues = self.sampler.coefficient_pvalues(observed_target, 
                                                        cov_target, 
                                                        cov_target_score, 
-<<<<<<< HEAD
                                                        self.K2,
                                                        self.test_stat,
-=======
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
                                                        parameter=np.zeros_like(parameter), 
                                                        sample=opt_sample,
                                                        alternatives=alternatives)
@@ -1161,16 +1552,15 @@ class rescaled_lasso_iv(lasso_iv):
 
         intervals = None
         if compute_intervals:
-<<<<<<< HEAD
             intervals = self.sampler.confidence_intervals(observed_target_tsls, 
                                                           cov_target, 
                                                           cov_target_score, 
                                                           self.K2,
                                                           self.test_stat,
-                                                          parameter=two_stage_ls,
+                                                          beta_reference=two_stage_ls,
                                                           sample=opt_sample,
                                                           level=level,
-                                                          how_many_sd=40)
+                                                          how_many_sd=4000)
 
         coverage = self.sampler.confidence_interval_coverage(observed_target_tsls,
                                                   cov_target,
@@ -1360,10 +1750,6 @@ class affine_gaussian_sampler_iv(affine_gaussian_sampler):
 
         limits = []
 
-        #for i in range(observed_target.shape[0]):
-        #    keep = np.zeros_like(observed_target)
-        #    keep[i] = 1.
-        #    limits.append(_intervals.confidence_interval(keep, level=level))
         limits.append(_intervals.confidence_interval(linear_func, test_stat, 
             beta_reference, level=level, how_many_sd=how_many_sd, how_many_steps=how_many_steps))
 
@@ -1430,10 +1816,6 @@ class affine_gaussian_sampler_iv(affine_gaussian_sampler):
                                             observed_target, ndraw)
         pvals = []
 
-        #for i in range(observed_target.shape[0]):
-        #    keep = np.zeros_like(observed_target)
-        #    keep[i] = 1.
-        #    pvals.append(_intervals.pivot(keep, candidate=parameter[i], alternative=alternatives[i]))
         pvals.append(_intervals.pivot(linear_func, parameter, 0., test_stat, 'greater'))
 
         return np.array(pvals)
@@ -1507,22 +1889,6 @@ class optimization_intervals_iv(optimization_intervals):
         #_norm = np.linalg.norm(linear_func)
         grid_min, grid_max = -how_many_sd * np.std(sample_stat), how_many_sd * np.std(sample_stat)
 
-        #def _rootU(gamma):
-            #return self.pivot(linear_func,
-            #                  beta_reference,
-            #                  gamma,
-            #                  test_stat,
-            #                  alternative='less') - (1 - level) / 2.
-        #def _rootL(gamma):
-            #return self.pivot(linear_func,
-            #                  beta_reference,
-            #                  gamma,
-            #                  test_stat,
-            #                  alternative='less') - (1 + level) / 2.
-
-        #upper = bisect(_rootU, grid_min, grid_max, xtol=1.e-5*(grid_max - grid_min))
-        #lower = bisect(_rootL, grid_min, grid_max, xtol=1.e-5*(grid_max - grid_min))
-
         def _root(gamma):
             return self.pivot(linear_func,
                               beta_reference,
@@ -1579,52 +1945,264 @@ class optimization_intervals_iv(optimization_intervals):
 
 
 
-# this method uses highdim class with 'selected' target which theoretically should give the desired result
-# simulation result works and it seems the way to set ridge_term and randomizer_scale matters       
-def lasso_iv_selected(gsnr=1., beta=1., sigma_12=0.8, ndraw=5000, burnin=1000):
+# using only summary statistics
+# summary data:
+# Ghat: Y ~ Z
+# ghat: D ~ Z
+# Gse, gse
+# set $Z_1^T Z_1 = 1$ since the factor does not matter for the inference result
+class lasso_iv_summary(lasso_iv):
 
-    Z, D, Y, alpha, beta, gamma = lasso_iv.bigaussian_instance(gsnr=gsnr, beta=beta, Sigma = np.array([[1., sigma_12], [sigma_12, 1.]]))
-    PZ = Z.dot(np.linalg.pinv(Z))
+    r"""
+    A class for the LASSO with invalid instrumental variables for post-selection inference.
+    The problem solved is
 
-    n, p = Z.shape
+    .. math::
 
-    penalty = 2.01 * np.sqrt(n * np.log(n))
-    penalty = np.ones(p + 1) * penalty
-    penalty[-1] = 0.
+        \text{minimize}_{\alpha, \beta} \frac{1}{2} \|P_Z (y-Z\alpha-D\beta)\|^2_2 + 
+            \lambda \|\alpha\|_1 - \omega^T(\alpha \beta) + \frac{\epsilon}{2} \|(\alpha \beta)\|^2_2
 
-    L = lasso.gaussian(PZ.dot(np.hstack([Z, D.reshape((-1,1))])), PZ.dot(Y), penalty)
-    signs = L.fit()
-    nonzero = np.nonzero(signs != 0)[0]
+    where $\lambda$ is `lam`, $\omega$ is a randomization generated below
+    and the last term is a small ridge penalty.
 
-    if p not in set(nonzero):
-        raise ValueError('last should always be selected!')
+    NOTE: use beta_tsls instead of the tsls test statistic itself, such to better fit the package structure
+    this works specifically for summary data and is a direct modification of lasso_iv class
 
-    if set(nonzero).issuperset(np.nonzero(alpha)[0]) and len(nonzero) <= p :
-        parameter = np.hstack([alpha[nonzero[:-1]], beta])
+    """
 
-        pivots, pval, intervals = L.summary(target="selected",
-                                            parameter=parameter,
-                                            ndraw=ndraw,
-                                            burnin=burnin,
-                                            level=0.95, 
-                                            compute_intervals=True,
-                                            dispersion=1.)
-        return pivots[-1:], (intervals[-1][0] < beta) * (intervals[-1][1] > beta)
+    def __init__(self,
+                 Ghat, 
+                 ghat,
+                 Gse,
+                 gse,
+                 penalty=None, 
+                 ridge_term=None,
+                 randomizer_scale=None,
+                 n=1000):
+    
+        # form the projected design and response
+        p = Ghat.shape[0]
+        self.n = n
+        self.p = p
 
-    return [], np.nan
-=======
-            intervals = self.sampler.confidence_intervals(observed_target, 
-                                                          cov_target, 
-                                                          cov_target_score, 
-                                                          sample=opt_sample)
+        Gks = (n - 1.) * Gse**2 + Ghat**2
+        self.ZTZ_diag = Gks[0] / Gks
+        sqrt_ZTZ_diag = np.sqrt(self.ZTZ_diag)
+        self.ZTY = Ghat * self.ZTZ_diag
+        self.ZTD = ghat * self.ZTZ_diag
 
-        return pivots, pvalues, intervals
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
+        #X = np.hstack([np.identity(p), ghat.reshape((-1,1))])
+        #Y = Ghat
+        X = np.hstack([np.diag(sqrt_ZTZ_diag), (self.ZTD / sqrt_ZTZ_diag).reshape((-1, 1))])
+        Y = self.ZTY / sqrt_ZTZ_diag
+        loglike = rr.glm.gaussian(X, Y)
+
+        if penalty is None:
+            penalty = 2.01 #* np.sqrt(n * np.log(n))
+        penalty = np.ones(loglike.shape[0]) * penalty
+        penalty[-1] = 0.
+
+        mean_diag = np.mean((X**2).sum(0))
+        if ridge_term is None:
+            #ridge_term = 1. * np.sqrt(n)
+            ridge_term = (np.std(Y) * np.sqrt(mean_diag) / np.sqrt(n - 1.))
+
+        if randomizer_scale is None:
+            #randomizer_scale = 0.5*np.sqrt(n)
+            randomizer_scale = np.sqrt(mean_diag) * 0.5 * np.std(Y) * np.sqrt(n / (n - 1.))
+        #else: 
+            #randomizer_scale *= np.sqrt(mean_diag) * np.std(Y) * np.sqrt(n / (n - 1.))
+
+        lasso.__init__(self, loglike, penalty, ridge_term, randomizer_scale)
+
+        self.Ghat = Ghat
+        self.ghat = ghat
+        self.Gse = Gse
+        self.gse = gse
 
 
-# use the tsls statistic instead of tsls beta as target
-# the null pivot is usable but CI is WRONG because of the importance weight
-class stat_lasso_iv(lasso_iv):
+    def fit_for_marginalize(self, 
+                            solve_args={'tol':1.e-12, 'min_its':50}, 
+                            perturb=None):
+
+        p = self.nfeature
+
+        # take a new perturbation if supplied
+        if perturb is not None:
+            self._initial_omega = perturb
+        if self._initial_omega is None:
+            self._initial_omega = self.randomizer.sample()
+
+        quad = rr.identity_quadratic(self.ridge_term, 0, -self._initial_omega, 0)
+        problem = rr.simple_problem(self.loglike, self.penalty)
+        self.initial_soln = problem.solve(quad, **solve_args)
+
+        active_signs = np.sign(self.initial_soln)
+        active = self._active = active_signs != 0
+
+        self._lagrange = self.penalty.weights
+        unpenalized = self._lagrange == 0
+
+        active *= ~unpenalized
+
+        self._overall = overall = (active + unpenalized) > 0
+        self._inactive = inactive = ~self._overall
+        self._unpenalized = unpenalized
+
+        _active_signs = active_signs.copy()
+        _active_signs[unpenalized] = np.nan # don't release sign of unpenalized variables
+        self.selection_variable = {'sign':_active_signs,
+                                   'variables':self._overall}
+
+        # initial state for opt variables
+
+        initial_subgrad = -(self.loglike.smooth_objective(self.initial_soln, 'grad') + 
+                            quad.objective(self.initial_soln, 'grad')) 
+        self.initial_subgrad = initial_subgrad
+
+        initial_scalings = np.fabs(self.initial_soln[active])
+        initial_unpenalized = self.initial_soln[self._unpenalized]
+
+        self.observed_opt_state = np.concatenate([initial_scalings,
+                                                  initial_unpenalized,
+                                                  self.initial_subgrad[self._inactive]], axis=0)
+
+        _beta_unpenalized = restricted_estimator(self.loglike, self._overall, solve_args=solve_args)
+
+        beta_bar = np.zeros(p)
+        beta_bar[overall] = _beta_unpenalized
+        self._beta_full = beta_bar
+
+        # observed state for score in internal coordinates
+
+        self.observed_internal_state = np.hstack([_beta_unpenalized,
+                                                  -self.loglike.smooth_objective(beta_bar, 'grad')[inactive]])
+
+        # form linear part
+
+        self.num_opt_var = self.observed_opt_state.shape[0]
+
+        # (\bar{\beta}_{E \cup U}, N_{-E}, c_E, \beta_U, z_{-E})
+        # E for active
+        # U for unpenalized
+        # -E for inactive
+
+        _opt_linear_term = np.zeros((p, self.num_opt_var))
+        _score_linear_term = np.zeros((p, self.num_opt_var))
+
+        # \bar{\beta}_{E \cup U} piece -- the unpenalized M estimator
+
+        est_slice = slice(0, overall.sum())
+        X, y = self.loglike.data
+        W = self._W = self.loglike.saturated_loss.hessian(X.dot(beta_bar))
+        _hessian_active = np.dot(X.T, X[:, active] * W[:, None])
+        _hessian_unpen = np.dot(X.T, X[:, unpenalized] * W[:, None])
+
+        _score_linear_term[:, est_slice] = -np.hstack([_hessian_active, _hessian_unpen])
+
+        null_idx = np.arange(overall.sum(), p)
+        inactive_idx = np.nonzero(inactive)[0]
+        for _i, _n in zip(inactive_idx, null_idx):
+            _score_linear_term[_i,_n] = -1
+
+        # set the observed score (data dependent) state
+
+        self.observed_score_state = _score_linear_term.dot(self.observed_internal_state)
+
+        def signed_basis_vector(p, j, s):
+            v = np.zeros(p)
+            v[j] = s
+            return v
+
+        active_directions = np.array([signed_basis_vector(p, j, active_signs[j]) for j in np.nonzero(active)[0]]).T
+
+        scaling_slice = slice(0, active.sum())
+        if np.sum(active) == 0:
+            _opt_hessian = 0
+        else:
+            _opt_hessian = _hessian_active * active_signs[None, active] + self.ridge_term * active_directions
+        _opt_linear_term[:, scaling_slice] = _opt_hessian
+
+        # beta_U piece
+
+        unpenalized_slice = slice(active.sum(), active.sum() + unpenalized.sum())
+        unpenalized_directions = np.array([signed_basis_vector(p, j, 1) for j in np.nonzero(unpenalized)[0]]).T
+        if unpenalized.sum():
+            _opt_linear_term[:, unpenalized_slice] = (_hessian_unpen
+                                                      + self.ridge_term * unpenalized_directions) 
+
+        subgrad_idx = range(active.sum() + unpenalized.sum(), active.sum() + inactive.sum() + unpenalized.sum())
+        subgrad_slice = slice(active.sum() + unpenalized.sum(), active.sum() + inactive.sum() + unpenalized.sum())
+        for _i, _s in zip(inactive_idx, subgrad_idx):
+            _opt_linear_term[_i,_s] = 1
+
+        # two transforms that encode score and optimization
+        # variable roles 
+
+        _opt_affine_term = np.zeros(p)
+        _opt_affine_term[active] = active_signs[active] * self._lagrange[active]
+
+        self.opt_transform = (_opt_linear_term, _opt_affine_term)
+        self.score_transform = (_score_linear_term, np.zeros(_score_linear_term.shape[0]))
+
+        # now store everything needed for the projections
+        # the projection acts only on the optimization
+        # variables
+
+        self._setup = True
+        self.scaling_slice = scaling_slice
+        self.unpenalized_slice = unpenalized_slice
+        self.ndim = self.loglike.shape[0]
+
+        # compute implied mean and covariance
+
+        cov, prec = self.randomizer.cov_prec
+        opt_linear, opt_offset = self.opt_transform
+
+        cond_precision = opt_linear.T.dot(opt_linear) * prec
+        cond_cov = np.linalg.inv(cond_precision)
+        logdens_linear = cond_cov.dot(opt_linear.T) * prec
+
+        cond_mean = -logdens_linear.dot(self.observed_score_state + opt_offset)
+
+        def log_density(logdens_linear, offset, cond_prec, score, opt):
+            if score.ndim == 1:
+                mean_term = logdens_linear.dot(score.T + offset).T
+            else:
+                mean_term = logdens_linear.dot(score.T + offset[:, None]).T
+            arg = opt + mean_term
+            return - 0.5 * np.sum(arg * cond_prec.dot(arg.T).T, 1)
+        log_density = functools.partial(log_density, logdens_linear, opt_offset, cond_precision)
+
+        # now make the constraints
+
+        inactive_lagrange = self.penalty.weights[inactive]
+
+        I = np.identity(cond_cov.shape[0])
+        A_scaling = -I[self.scaling_slice]
+        b_scaling = np.zeros(A_scaling.shape[0])
+        A_subgrad = np.vstack([I[subgrad_slice],-I[subgrad_slice]])
+        b_subgrad = np.hstack([inactive_lagrange,inactive_lagrange])
+
+        linear_term = np.vstack([A_scaling, A_subgrad])
+        offset = np.hstack([b_scaling, b_subgrad])
+
+        affine_con = constraints(linear_term,
+                                 offset,
+                                 mean=cond_mean,
+                                 covariance=cond_cov)
+
+        logdens_transform = (logdens_linear, opt_offset)
+
+        self.sampler = affine_gaussian_sampler(affine_con,
+                                               self.observed_opt_state,
+                                               self.observed_score_state,
+                                               log_density,
+                                               logdens_transform,
+                                               selection_info=self.selection_variable) # should be signs and the subgradients we've conditioned on
+        
+        return active_signs
+
 
     def summary(self,
                 parameter=None,
@@ -1632,7 +2210,9 @@ class stat_lasso_iv(lasso_iv):
                 level=0.95,
                 ndraw=10000, 
                 burnin=2000,
-                compute_intervals=False):
+                compute_intervals=True,
+                compute_power=False,
+                beta_alternative=None):
         """
         Produce p-values and confidence intervals for targets
         of model including selected features
@@ -1660,38 +2240,49 @@ class stat_lasso_iv(lasso_iv):
 
         """
 
+        p = self.Ghat.shape[0]
+
         if parameter is None: # this is for pivot -- could use true beta^*
-            parameter = 0.
+            parameter = np.zeros(1)
+
+        parameter = np.atleast_1d(parameter)
 
         # compute tsls, i.e. the observed_target
 
-        P_Z = self.Z.dot(np.linalg.pinv(self.Z))
-        P_ZE = self.Z[:,self._overall[:-1]].dot(np.linalg.pinv(self.Z[:,self._overall[:-1]]))
-        P_ZX, P_ZY = self.loglike.data
-        P_ZD = P_ZX[:,-1]
-        two_stage_ls = (P_ZD.dot(P_Z-P_ZE).dot(P_ZY-P_ZD*parameter))/np.sqrt(Sigma_11*P_ZD.dot(P_Z-P_ZE).dot(P_ZD))
-        #denom = P_ZD.dot(P_Z - P_ZE).dot(P_ZD)
-        #two_stage_ls = (P_ZD.dot(P_Z - P_ZE).dot(P_ZY)) / denom
-        two_stage_ls = np.atleast_1d(two_stage_ls)
+        #self.GhatE = self.Ghat[self._overall[:-1]]
+        self.ghatE = self.ghat[self._overall[:-1]]
+        #denom = self.ghat.dot(self.ghat)-self.ghatE.dot(self.ghatE)
+        #two_stage_ls = (self.ghat.dot(self.Ghat)-self.ghatE.dot(self.GhatE))/denom
+        self.ZTYE = self.ZTY[self._overall[:-1]]
+        self.ZTDE = self.ZTD[self._overall[:-1]]
+        self.ZTZE = self.ZTZ_diag[self._overall[:-1]]
+        self.ZTZ_inv_diag = 1. / self.ZTZ_diag
+        self.ZTZE_inv_diag = self.ZTZ_inv_diag[self._overall[:-1]]
+        denom = np.sum(self.ZTD**2 * self.ZTZ_inv_diag) - np.sum(self.ZTDE**2 * self.ZTZE_inv_diag)
+        num = np.sum(self.ZTD * self.ZTZ_inv_diag * self.ZTY) - np.sum(self.ZTDE * self.ZTZE_inv_diag * self.ZTYE)
+        self.two_stage_ls = num / denom
+        two_stage_ls = np.atleast_1d(self.two_stage_ls)
         observed_target = two_stage_ls
 
         # only has the parametric version right now
         # compute cov_target, cov_target_score
 
-        cov_target = np.atleast_2d(1.)
-
-        cov_target_score = -1.*np.sqrt(Sigma_11/P_ZD.dot(P_Z-P_ZE).dot(P_ZD))*np.hstack([self.Z.T.dot(P_Z-P_ZE).dot(P_ZD),P_ZD.dot(P_Z-P_ZE).dot(P_ZD)])
-        #cov_target_score = -1.*(Sigma_11/denom)*np.hstack([self.Z.T.dot(P_Z-P_ZE).dot(P_ZD),P_ZD.dot(P_Z-P_ZE).dot(P_ZD)])
+        cov_target = np.atleast_2d(Sigma_11/denom)
+        tmp = np.zeros(p)
+        #tmp[self._overall[:-1]] = self.ghatE
+        #cov_target_score = -1.*(Sigma_11/denom)*np.hstack([self.ghat - tmp, denom])\
+        tmp[self._overall[:-1]] = self.ZTZE * self.ghatE
+        cov_target_score = -1.*(Sigma_11/denom)*np.hstack([self.ZTD - tmp, denom])
         cov_target_score = np.atleast_2d(cov_target_score)
 
         alternatives = ['twosided']
 
         opt_sample = self.sampler.sample(ndraw, burnin)
 
-        # set parameter to be zero!
         pivots = self.sampler.coefficient_pvalues(observed_target, 
                                                   cov_target, 
                                                   cov_target_score, 
+                                                  parameter=parameter, 
                                                   sample=opt_sample,
                                                   alternatives=alternatives)
 
@@ -1699,6 +2290,7 @@ class stat_lasso_iv(lasso_iv):
             pvalues = self.sampler.coefficient_pvalues(observed_target, 
                                                        cov_target, 
                                                        cov_target_score, 
+                                                       parameter=np.zeros_like(parameter), 
                                                        sample=opt_sample,
                                                        alternatives=alternatives)
         else:
@@ -1709,46 +2301,76 @@ class stat_lasso_iv(lasso_iv):
             intervals = self.sampler.confidence_intervals(observed_target, 
                                                           cov_target, 
                                                           cov_target_score, 
-                                                          sample=opt_sample)
+                                                          sample=opt_sample,
+                                                          level=level)
+
+        if compute_power:
+            if beta_alternative is None:
+                beta_alternative = np.array([i*0.02+parameter[0] for i in range(-5,6) if i != 0])
+            powers=[~(intervals[0][0]<=beta and beta<=intervals[0][1]) for beta in beta_alternative]
+
+            return pivots, pvalues, intervals, powers
 
         return pivots, pvalues, intervals
 
-<<<<<<< HEAD
+    # seG, seg are se(Ghat), se(ghat)
+    def estimate_covariance(self):
 
-=======
-        
-def test_lasso_iv(ndraw=5000, burnin=1000):
+        self.ZTYE = self.ZTY[self._overall[:-1]]
+        self.ZTDE = self.ZTD[self._overall[:-1]]
+        self.ZTZE = self.ZTZ_diag[self._overall[:-1]]
+        self.ZTZ_inv_diag = 1. / self.ZTZ_diag
+        self.ZTZE_inv_diag = self.ZTZ_inv_diag[self._overall[:-1]]
+        denom = np.sum(self.ZTD**2 * self.ZTZ_inv_diag) - np.sum(self.ZTDE**2 * self.ZTZE_inv_diag)
+        num = np.sum(self.ZTD * self.ZTZ_inv_diag * self.ZTY) - np.sum(self.ZTDE * self.ZTZE_inv_diag * self.ZTYE)
+        beta_estim = num / denom
 
-    Z, D, Y, alpha, beta, gamma = lasso_iv.bigaussian_instance()
-    PZ = Z.dot(np.linalg.pinv(Z))
+        #self.GhatE = self.Ghat[self._overall[:-1]]
+        #self.ghatE = self.ghat[self._overall[:-1]]
+        #denom = self.ghat.dot(self.ghat)-self.ghatE.dot(self.ghatE)
+        #beta_estim = (self.ghat.dot(self.Ghat)-self.ghatE.dot(self.GhatE))/denom
 
-    n, p = Z.shape
+        YTY = (self.n-1.)*self.Gse[0]**2+self.Ghat[0]**2
+        DTD = (self.n-1.)*self.gse[0]**2+self.ghat[0]**2
+        Omega_11 = (YTY - np.sum(self.ZTY**2/self.ZTZ_diag)) / (self.n - self.p + 1.)
+        Omega_22 = (DTD - np.sum(self.ZTD**2/self.ZTZ_diag)) / (self.n - self.p + 1.)
+        Omega = np.diag([Omega_11, Omega_22])
+        coef_mat = np.identity(2)
+        coef_mat[0,1] = -beta_estim
+        Sigma = coef_mat.dot(Omega).dot(coef_mat.T)
+        cov_estim = Sigma[0,0]
 
-    penalty = 2.01 * np.sqrt(n * np.log(n))
-    penalty = np.ones(p + 1) * penalty
-    penalty[-1] = 0.
+        return cov_estim
 
-    L = highdim.gaussian(PZ.dot(np.hstack([Z, D.reshape((-1,1))])), PZ.dot(Y), penalty)
-    signs = L.fit()
-    nonzero = np.nonzero(signs != 0)[0]
+    def naive_inference(self, 
+                        parameter=None,
+                        Sigma_11 = 1.,
+                        compute_intervals=False,
+                        level=0.95):
 
-    if p not in set(nonzero):
-        raise ValueError('last should always be selected!')
+        if parameter is None:
+            parameter = 0.
 
-    if set(nonzero).issuperset(np.nonzero(alpha)[0]) and len(nonzero) <= p :
-        parameter = np.hstack([alpha[nonzero[:-1]], beta])
+        #self.GhatE = self.Ghat[self._overall[:-1]]
+        #self.ghatE = self.ghat[self._overall[:-1]]
+        #denom = self.ghat.dot(self.ghat)-self.ghatE.dot(self.ghatE)
+        #tsls = (self.ghat.dot(self.Ghat)-self.ghatE.dot(self.GhatE))/denom 
 
-        pivots, pval, intervals = L.summary(target="selected",
-                                            parameter=parameter,
-                                            ndraw=ndraw,
-                                            burnin=burnin, 
-                                            compute_intervals=True,
-                                            dispersion=1.)
-        return pivots[-1:], (intervals[-1][0] < beta) * (intervals[-1][1] > beta)
-
-    return [], np.nan
->>>>>>> f125cdb72d4da3c41710cf85fa9c797c5b9c0678
-
+        self.ZTYE = self.ZTY[self._overall[:-1]]
+        self.ZTDE = self.ZTD[self._overall[:-1]]
+        self.ZTZE = self.ZTZ_diag[self._overall[:-1]]
+        self.ZTZ_inv_diag = 1. / self.ZTZ_diag
+        self.ZTZE_inv_diag = self.ZTZ_inv_diag[self._overall[:-1]]
+        denom = np.sum(self.ZTD**2 * self.ZTZ_inv_diag) - np.sum(self.ZTDE**2 * self.ZTZE_inv_diag)
+        num = np.sum(self.ZTD * self.ZTZ_inv_diag * self.ZTY) - np.sum(self.ZTDE * self.ZTZE_inv_diag * self.ZTYE)
+        tsls = num / denom        
+        std = np.sqrt(Sigma_11 / denom)
+        pval = norm.cdf(tsls, loc=parameter, scale=std)
+        pval = 2. * min(pval, 1-pval)
+        interval = None
+        if compute_intervals:
+            interval = [tsls - std * norm.ppf(q=(level+1.)/2.), tsls + std * norm.ppf(q=(level+1.)/2.)]
+        return pval, interval
 
 
 

@@ -1,7 +1,7 @@
 import numpy as np
 
 import selection.randomized.lasso as L; reload(L)
-from selection.randomized.lasso_iv import lasso_iv, lasso_iv_ar, group_lasso_iv
+from selection.randomized.lasso_iv import lasso_iv, lasso_iv_ar, group_lasso_iv, group_lasso_iv_ar, weak_iv_clr, lasso_iv_summary
 import matplotlib.pyplot as plt
 from statsmodels.distributions import ECDF
 
@@ -13,12 +13,133 @@ from statsmodels.distributions import ECDF
 
 ################################################################################
 
+
+def test_weak_iv_clr(nsim=500, n=1000, p=10, Sigma_12=0.8, gsnr=1., beta_star=1., nsep=100):
+    P0 = []
+    #coverages = []
+    #lengths = []
+    for i in range(nsim):
+        Z, D, Y, beta, gamma = group_lasso_iv.bigaussian_instance(n=n, p=p, beta=beta_star, gsnr=gsnr, 
+            Sigma = np.array([[1., Sigma_12], [Sigma_12, 1.]]))
+        conv = weak_iv_clr(Y, D, Z)
+        if not conv.pre_test():
+            conv.setup(parameter=beta_star)
+            p0 = conv.evaluate(nsep=nsep)
+            P0.append(p0)
+            #interval = conv.confidence_interval(beta_star, how_many=1.)
+            #coverages.extend([(interval[0] < beta_star) * (interval[1] > beta_star)])
+            #lengths.extend([interval[1] - interval[0]])
+
+    print len(P0), ' instances not passing pre-test out of ', nsim, ' total instances'
+    print 'pivots: ', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05)
+    #print('confidence intervals', np.mean(coverages), np.mean(lengths))
+
+    return P0
+
+
+def test_weak_iv_clr_naive(nsim=500, n=1000, p=10, Sigma_12=0.8, gsnr=1., beta_star=1., nsep=100):
+    P0 = []
+    for i in range(nsim):
+        Z, D, Y, beta, gamma = group_lasso_iv.bigaussian_instance(n=n, p=p, beta=beta_star, gsnr=gsnr, 
+            Sigma = np.array([[1., Sigma_12], [Sigma_12, 1.]]))
+        conv = weak_iv_clr(Y, D, Z)
+        if not conv.pre_test():
+            conv.setup(parameter=beta_star)
+            p0 = conv.naive_evaluate(nsep=nsep)
+            P0.append(p0)
+    print len(P0), ' instances not passing pre-test out of ', nsim, ' total instances'
+    print 'pivots: ', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05)
+
+    return P0
+
+
 # if true_model is True, Sigma_12 is the true Sigma_{12}
 # otherwise Sigma_12 will be the consistent estimator
-def test_group_lasso_iv_instance(n=1000, p=10, s=3, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1., marginalize=False):
+def test_group_lasso_iv_ar_instance(n=1000, p=10, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1., marginalize=False, randomizer_scale=None):
 
     Z, D, Y, beta, gamma = group_lasso_iv.bigaussian_instance(beta=beta_star, gsnr=gsnr,Sigma = np.array([[1., Sigma_12], [Sigma_12, 1.]]))
-    conv = group_lasso_iv(Y,D,Z)
+    conv = group_lasso_iv_ar(Y,D,Z, randomizer_scale=randomizer_scale)
+    passed = conv.fit()
+    if not passed:
+        return None, None
+
+    if true_model is True:
+        sigma_11 = 1.
+        sigma_12 = Sigma_12
+    else:
+        Sigma_matrix = conv.estimate_covariance()
+        sigma_11 = Sigma_matrix[0,0]
+        sigma_12 = Sigma_matrix[0,1]
+
+    pivot = None
+    coverage = None
+
+    pivot, _, coverage = conv.summary(parameter=beta_star, Sigma_11=sigma_11, Sigma_12=sigma_12)
+
+    return pivot, coverage
+
+
+def test_pivots_group_lasso_ar(nsim=500, n=1000, p=10, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1., marginalize=False, randomizer_scale=None):
+    P0 = []
+    #intervals = []
+    coverages = []
+    #lengths = []
+    for i in range(nsim):
+        p0, coverage = test_group_lasso_iv_ar_instance(n=n, p=p, true_model=true_model, Sigma_12=Sigma_12, gsnr=gsnr, beta_star=beta_star, marginalize=marginalize, randomizer_scale=randomizer_scale)
+        if p0 is not None:
+            P0.extend(p0)
+            #intervals.extend(interval)
+            coverages.append(coverage)
+            #lengths.extend([interval[0][1] - interval[0][0]])
+
+    print len(P0), ' instances passing pre-test out of ', nsim, ' total instances'
+    print 'pivots', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05)
+    print 'coverages', np.mean(coverages)
+    #print 'confidence intervals', np.mean(coverages), np.mean(lengths)
+
+    return P0
+
+def naive_pre_test_ar_instance(n=1000, p=10, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1.):
+
+    Z, D, Y, beta, gamma = group_lasso_iv.bigaussian_instance(n=n, p=p, beta=beta_star, gsnr=gsnr,Sigma = np.array([[1., Sigma_12], [Sigma_12, 1.]]))
+    conv = group_lasso_iv_ar(Y,D,Z)
+
+    if true_model is True:
+        sigma_11 = 1.
+        sigma_12 = Sigma_12
+    else:
+        Sigma_matrix = conv.estimate_covariance()
+        sigma_11 = Sigma_matrix[0,0]
+        sigma_12 = Sigma_matrix[0,1]
+
+    pval = conv.naive_inference(parameter=beta_star, Sigma_11 = sigma_11, Sigma_12 = sigma_12)
+    
+    return pval
+
+def test_pivots_naive_pre_test_ar(nsim=500, n=1000, p=10, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1.):
+    P0 = []
+    #intervals = []
+    #coverages = []
+    #lengths = []
+    for i in range(nsim):
+        p0 = naive_pre_test_ar_instance(n=n, p=p, true_model=true_model, Sigma_12=Sigma_12, gsnr=gsnr, beta_star=beta_star)
+        if p0 is not None:
+            P0.extend([p0])
+            #intervals.extend(interval)
+
+    print len(P0), ' instances passing pre-test out of ', nsim, ' total instances' 
+    print 'pivots', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05)
+    #print 'confidence intervals', np.mean(coverages), np.mean(lengths)
+
+    return P0
+
+
+# if true_model is True, Sigma_12 is the true Sigma_{12}
+# otherwise Sigma_12 will be the consistent estimator
+def test_group_lasso_iv_instance(n=1000, p=10, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1., marginalize=False, randomizer_scale=None):
+
+    Z, D, Y, beta, gamma = group_lasso_iv.bigaussian_instance(beta=beta_star, gsnr=gsnr,Sigma = np.array([[1., Sigma_12], [Sigma_12, 1.]]))
+    conv = group_lasso_iv(Y,D,Z, randomizer_scale=randomizer_scale)
     passed = conv.fit()
     if not passed:
         return None, None
@@ -39,29 +160,29 @@ def test_group_lasso_iv_instance(n=1000, p=10, s=3, ndraw=10000, burnin=2000, tr
     return pivot, interval
 
 
-def test_pivots_group_lasso(nsim=500, n=1000, p=10, s=3, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1., marginalize=False):
+def test_pivots_group_lasso(nsim=500, n=1000, p=10, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1., marginalize=False, randomizer_scale=None):
     P0 = []
     #intervals = []
     coverages = []
     lengths = []
     for i in range(nsim):
-        p0, interval= test_group_lasso_iv_instance(n=n, p=p, s=s, true_model=true_model, Sigma_12=Sigma_12, gsnr=gsnr, beta_star=beta_star, marginalize=marginalize)
+        p0, interval= test_group_lasso_iv_instance(n=n, p=p, true_model=true_model, Sigma_12=Sigma_12, gsnr=gsnr, beta_star=beta_star, marginalize=marginalize, randomizer_scale=randomizer_scale)
         if p0 is not None:
             P0.extend(p0)
             #intervals.extend(interval)
             coverages.extend([(interval[0][0] < beta_star) * (interval[0][1] > beta_star)])
             lengths.extend([interval[0][1] - interval[0][0]])
 
-    print(len(P0), ' instances passing pre-test out of ', nsim, ' total instances')
-    print('pivots', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05))
-    print('confidence intervals', np.mean(coverages), np.mean(lengths))
+    print len(P0), ' instances passing pre-test out of ', nsim, ' total instances'
+    print 'pivots', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05)
+    print 'confidence intervals', np.mean(coverages), np.mean(lengths)
 
     return P0
 
 
-def naive_pre_test_instance(n=1000, p=10, s=3, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1.):
+def naive_pre_test_instance(n=1000, p=10, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1.):
 
-    Z, D, Y, beta, gamma = group_lasso_iv.bigaussian_instance(beta=beta_star, gsnr=gsnr,Sigma = np.array([[1., Sigma_12], [Sigma_12, 1.]]))
+    Z, D, Y, beta, gamma = group_lasso_iv.bigaussian_instance(n=n, p=p, beta=beta_star, gsnr=gsnr,Sigma = np.array([[1., Sigma_12], [Sigma_12, 1.]]))
     conv = group_lasso_iv(Y,D,Z)
 
     if true_model is True:
@@ -75,22 +196,22 @@ def naive_pre_test_instance(n=1000, p=10, s=3, true_model=True, Sigma_12=0.8, gs
     return pval, interval
 
 
-def test_pivots_naive_pre_test(nsim=500, n=1000, p=10, s=3, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1.):
+def test_pivots_naive_pre_test(nsim=500, n=1000, p=10, true_model=True, Sigma_12=0.8, gsnr=1., beta_star=1.):
     P0 = []
     #intervals = []
     coverages = []
     lengths = []
     for i in range(nsim):
-        p0, interval= naive_pre_test_instance(n=n, p=p, s=s, true_model=true_model, Sigma_12=Sigma_12, gsnr=gsnr, beta_star=beta_star)
+        p0, interval= naive_pre_test_instance(n=n, p=p, true_model=true_model, Sigma_12=Sigma_12, gsnr=gsnr, beta_star=beta_star)
         if p0 is not None:
             P0.extend([p0])
             #intervals.extend(interval)
             coverages.extend([(interval[0] < beta_star) * (interval[1] > beta_star)])
             lengths.extend([interval[1] - interval[0]])
 
-    print(len(P0), ' instances passing pre-test out of ', nsim, ' total instances')
-    print('pivots', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05))
-    print('confidence intervals', np.mean(coverages), np.mean(lengths))
+    print len(P0), ' instances passing pre-test out of ', nsim, ' total instances' 
+    print 'pivots', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05)
+    print 'confidence intervals', np.mean(coverages), np.mean(lengths)
 
     return P0
 
@@ -179,8 +300,8 @@ def test_pivots(nsim=500, n=1000, p=10, s=3, ndraw=10000, burnin=2000, true_mode
     #plt.plot(U, U, 'k--')
     #plt.show()
 
-    #return P0
-    return lengths
+    return P0
+    #return lengths
 
 
 # if true_model is True, Sigma_12 is the true Sigma_{12}
@@ -232,6 +353,62 @@ def test_pivots_ar(nsim=500, n=1000, p=10, s=3, ndraw=10000, burnin=2000, true_m
     #plt.show()
 
     return P0
+
+
+# if true_model is True, Sigma_12 is the true Sigma_{12}
+# otherwise Sigma_12 will be the consistent estimator (?)
+def test_lasso_iv_summary_instance(n=1000, p=10, s=3, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr_invalid=1., gsnr_valid=1., beta_star=1., marginalize=False):
+
+    Z, D, Y, alpha, beta_star, gamma = lasso_iv_summary.bigaussian_instance(n=n,p=p,s=s, gsnr_invalid=gsnr_invalid, gsnr_valid=gsnr_valid, beta=beta_star,Sigma=np.array([[1., Sigma_12],[Sigma_12, 1.]]))
+
+    Ghat = Z.T.dot(Y)
+    ghat = Z.T.dot(D)
+
+    conv = lasso_iv_summary(Ghat, ghat)
+    if marginalize:
+        conv.fit_for_marginalize()
+    else:
+        conv.fit()
+
+    if true_model is True:
+        sigma_11 = 1.
+    else:
+        sigma_11 = conv.estimate_covariance()
+
+    pivot = None
+    interval = None
+    power = None
+    if set(np.nonzero(alpha)[0]).issubset(np.nonzero(conv._overall)[0]) and conv._inactive.sum()>0:
+        pivot, _, interval, power = conv.summary(parameter=beta_star, Sigma_11=sigma_11, compute_power=True)
+    return pivot, interval, power
+
+def test_pivots_summary(nsim=500, n=1000, p=10, s=3, ndraw=10000, burnin=2000, true_model=True, Sigma_12=0.8, gsnr_invalid=1., gsnr_valid=1., beta_star=1., marginalize=False):
+    P0 = []
+    #intervals = []
+    coverages = []
+    lengths = []
+    powers = []
+    for i in range(nsim):
+        p0, interval, power = test_lasso_iv_summary_instance(n=n, p=p, s=s, true_model=true_model, Sigma_12=Sigma_12, gsnr_invalid=gsnr_invalid, gsnr_valid=gsnr_valid, beta_star=beta_star, marginalize=marginalize)
+        if p0 is not None and interval is not None:
+            P0.extend(p0)
+            #intervals.extend(interval)
+            coverages.extend([(interval[0][0] < beta_star) * (interval[0][1] > beta_star)])
+            lengths.extend([interval[0][1] - interval[0][0]])
+            powers.append(power)
+
+    print('pivots', np.mean(P0), np.std(P0), np.mean(np.array(P0) < 0.05))
+    print('confidence intervals', np.mean(coverages), np.mean(lengths), np.std(lengths))
+    print('powers', np.mean(np.array(powers), axis=0))
+
+    #U = np.linspace(0, 1, 101)
+    #plt.plot(U, ECDF(P0)(U))
+    #plt.plot(U, U, 'k--')
+    #plt.show()
+
+    return P0
+    #return lengths
+
 
 
 def main(nsim=500):
